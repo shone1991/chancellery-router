@@ -1,403 +1,217 @@
-import dotenv from 'dotenv';
-dotenv.config();
+require('dotenv').config();
 
 const express = require('express');
+const cors = require('cors');
 const multer = require('multer');
-const fs = require('fs').promises;
+const fs = require('fs');
+const fsp = require('fs').promises;
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
-
+const { scrapeDepartments } = require('./scraper');
 
 const app = express();
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: './uploads',
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  }
-});
-
-const upload = multer({
-  storage,
-  fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg'];
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF and image files are allowed'));
-    }
-  }
-});
-
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, 'uploads');
-fs.mkdir(uploadsDir).catch(() => {}); // Ignore if exists
-
-// Middleware
+app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json());
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  next();
+
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: uploadsDir,
+  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
 });
 
-// Department database (can be connected to actual database)
-const departmentDatabase = {
-  'Ministry of Education': {
-    head: 'Dr. Oybek Khaitov',
-    keywords: ['education', 'school', 'university', 'student', 'curriculum', 'teaching', 'academic'],
-    description: 'Handles educational matters, policies, and correspondence'
-  },
-  'Ministry of Finance': {
-    head: 'Jamshid Kuchkarov',
-    keywords: ['budget', 'finance', 'funding', 'tax', 'accounting', 'fiscal', 'payment', 'monetary'],
-    description: 'Manages financial matters and budgetary allocations'
-  },
-  'Ministry of Health': {
-    head: 'Dr. Alisher Shadmanov',
-    keywords: ['health', 'medical', 'hospital', 'patient', 'disease', 'vaccination', 'clinic', 'healthcare'],
-    description: 'Oversees health services and medical policies'
-  },
-  'Ministry of Infrastructure': {
-    head: 'Adham Khanov',
-    keywords: ['infrastructure', 'construction', 'road', 'bridge', 'transport', 'building', 'project', 'development'],
-    description: 'Manages infrastructure projects and development'
-  },
-  'Ministry of Internal Affairs': {
-    head: 'Pulat Khaitov',
-    keywords: ['security', 'police', 'law enforcement', 'order', 'regulation', 'compliance', 'safety'],
-    description: 'Handles security and internal affairs'
-  },
-  'Ministry of Environment': {
-    head: 'Davron Khuzhaev',
-    keywords: ['environment', 'ecology', 'pollution', 'water', 'air', 'green', 'sustainability', 'natural'],
-    description: 'Focuses on environmental protection and sustainability'
-  },
-  'Ministry of Labor': {
-    head: 'Nozim Khaitov',
-    keywords: ['employment', 'labor', 'worker', 'wage', 'benefits', 'pension', 'workplace', 'job'],
-    description: 'Manages labor relations and employment matters'
-  },
-  'Ministry of Agriculture': {
-    head: 'Bekzod Khaitov',
-    keywords: ['agriculture', 'farm', 'crop', 'livestock', 'soil', 'harvest', 'rural', 'farming'],
-    description: 'Oversees agricultural policies and farming matters'
-  },
-  'Ministry of Culture': {
-    head: 'Mohinur Mirkhanova',
-    keywords: ['culture', 'art', 'heritage', 'museum', 'historical', 'cultural', 'tourism', 'tradition'],
-    description: 'Manages cultural affairs and heritage preservation'
-  },
-  'Ministry of Foreign Affairs': {
-    head: 'Abdulaziz Khaitov',
-    keywords: ['international', 'foreign', 'embassy', 'diplomat', 'agreement', 'treaty', 'cooperation', 'bilateral'],
-    description: 'Handles international relations and diplomatic affairs'
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype === 'application/pdf' || file.mimetype.startsWith('image/')) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only PDF and image files are allowed'), false);
   }
 };
 
-/**
- * Extract text and analyze document using Claude Vision
- */
-async function analyzeDocument(filePath, fileName) {
-  const fileBuffer = await fs.readFile(filePath);
-  const base64Data = fileBuffer.toString('base64');
-  
-  // Determine media type
-  const ext = path.extname(fileName).toLowerCase();
-  let mediaType = 'application/pdf';
-  if (['.jpg', '.jpeg', '.png'].includes(ext)) {
-    mediaType = `image/${ext === '.png' ? 'png' : 'jpeg'}`;
-  }
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE) || 15 * 1024 * 1024 }
+});
 
-  // Call Claude with vision to extract and analyze content
+// Departments loaded from scraper: [{ id, name, head }]
+let departments = [];
+
+async function loadDepartments() {
+  const url = process.env.SCRAPER_URL;
+  if (!url) {
+    console.warn('SCRAPER_URL not set — departments will be empty');
+    return;
+  }
+  try {
+    departments = await scrapeDepartments(url);
+    console.log(`Loaded ${departments.length} departments from ${url}`);
+  } catch (err) {
+    console.error('Failed to scrape departments:', err.message);
+  }
+}
+
+async function analyze(filePath, fileMime, fileName) {
+  const base64 = (await fsp.readFile(filePath)).toString('base64');
+
+  const deptList = departments.length
+    ? departments.map(d => `- ${d.name}`).join('\n')
+    : 'No departments available';
+
   const response = await client.messages.create({
     model: 'claude-opus-4-6',
-    max_tokens: 2000,
+    max_tokens: 4000,
     messages: [
       {
         role: 'user',
         content: [
           {
-            type: 'document' || 'image',
+            type: 'document',
             source: {
               type: 'base64',
-              media_type: mediaType,
-              data: base64Data
+              media_type: fileMime === 'application/pdf' ? 'application/pdf' : fileMime,
+              data: base64
             }
           },
           {
             type: 'text',
-            text: `Analyze this official correspondence document and provide:
-1. Main subject/title
-2. Key topics and keywords (comma-separated)
-3. Primary purpose (brief)
-4. Any mentioned departments or agencies
-5. Urgency level (High/Medium/Low)
-6. Document type (Directive/Request/Notification/Complaint/Other)
+            text: `Siz Jizzax Politexnika Instituti kancellyariyasining hujjat yo'naltirish tizimisiz.
+Quyidagi hujjatni tahlil qiling va tegishli kafedra(lar)ga yo'naltiring.
 
-Format your response as JSON with these exact keys: subject, keywords, purpose, mentioned_departments, urgency, document_type`
+Institutdagi mavjud kafedralar (faqat shu ro'yxatdan foydalaning):
+${deptList}
+
+Faqat to'g'ri JSON qaytaring (markdown yoki izoh yo'q):
+
+{
+  "summary_uz": "Hujjatning qisqacha mazmuni o'zbek tilida (2-3 gap)",
+  "subject": "Hujjat mavzusi bir gapda o'zbek tilida",
+  "documentType": "Xat/Ariza/Hisobot/So'rov/Farmoyish/Boshqa",
+  "urgency": "Yuqori/O'rta/Past",
+  "purpose": "Hujjatning maqsadi qisqacha o'zbek tilida",
+  "keywords": ["kalit so'z1", "kalit so'z2", "kalit so'z3"],
+  "departments": [
+    {
+      "name": "ro'yxatdagi kafedra nomini aynan ko'chiring",
+      "confidence": 85,
+      "reason": "nima uchun bu kafedra javobgar"
+    }
+  ]
+}
+
+MUHIM:
+- Faqat yuqoridagi ro'yxatdagi kafedra nomlarini ishlating, o'zgartirmasdan aynan ko'chiring
+- Hujjat bir nechta kafedrani qamrab olsa, barchasini kiriting
+- Hujjat butun institut yoki barcha kafedralarni qamrab olsa ham, eng tegishlilarini confidence bo'yicha tartibling
+- confidence 0 dan 100 gacha
+- Natijalarni confidence bo'yicha kamayish tartibida joylashtiring`
           }
         ]
       }
     ]
   });
 
-  // Extract JSON from response
-  const textContent = response.content.find(c => c.type === 'text');
-  if (!textContent) {
-    throw new Error('No text response from Claude');
-  }
+  const text = response.content.find(c => c.type === 'text')?.text;
 
+  let parsed;
   try {
-    // Extract JSON from response (handle markdown code blocks)
-    let jsonStr = textContent.text;
-    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[0];
-    }
-    return JSON.parse(jsonStr);
-  } catch (e) {
-    console.error('Failed to parse Claude response:', textContent.text);
-    // Fallback: return empty analysis
-    return {
-      subject: fileName,
-      keywords: [],
-      purpose: 'Unable to parse',
-      mentioned_departments: [],
-      urgency: 'Medium',
-      document_type: 'Unknown'
-    };
+    const raw = text.match(/\{[\s\S]*\}/)?.[0];
+    if (!raw) throw new Error('No JSON found in response');
+
+    // Normalize Uzbek curly apostrophes to straight ones so JSON.parse accepts them
+    const sanitized = raw
+      .replace(/\u2018|\u2019|\u02bc|\u0027/g, "'")  // various apostrophe variants
+      .replace(/[\u0000-\u001F\u007F]/g, ' ');        // strip control chars
+
+    parsed = JSON.parse(sanitized);
+  } catch (err) {
+    console.error('Parse error:', err);
+    console.error('Raw response snippet:', text?.slice(0, 500));
+    throw new Error('Failed to parse AI response');
   }
-}
 
-/**
- * Categorize document and rank departments
- */
-function categorizeDepartments(analysis) {
-  const keywordsList = Array.isArray(analysis.keywords)
-    ? analysis.keywords
-    : (typeof analysis.keywords === 'string'
-        ? analysis.keywords.split(',').map(k => k.trim().toLowerCase())
-        : []);
+  // Normalize helper: lowercase + collapse spaces + strip punctuation
+  const norm = s => s.toLowerCase().replace(/[''`]/g, "'").replace(/\s+/g, ' ').trim();
 
-  const departmentScores = {};
-
-  // Initialize all departments with score 0
-  Object.keys(departmentDatabase).forEach(dept => {
-    departmentScores[dept] = {
-      score: 0,
-      matchedKeywords: [],
-      head: departmentDatabase[dept].head
-    };
-  });
-
-  // Score each department
-  Object.entries(departmentDatabase).forEach(([dept, data]) => {
-    let score = 0;
-    const matched = [];
-
-    data.keywords.forEach(keyword => {
-      // Check if keyword appears in analysis keywords or subject/purpose
-      const inKeywords = keywordsList.some(k => 
-        k.includes(keyword.toLowerCase()) || keyword.toLowerCase().includes(k)
+  // Build ranked department list, merging head info from scraped data
+  const rankedDepts = (parsed.departments || []).map(d => {
+    const dNorm = norm(d.name);
+    // 1) exact normalized match
+    let scraped = departments.find(sd => norm(sd.name) === dNorm);
+    // 2) one contains the other (handles minor truncation/addition by Claude)
+    if (!scraped) {
+      scraped = departments.find(
+        sd => norm(sd.name).includes(dNorm) || dNorm.includes(norm(sd.name))
       );
-      
-      const inText = 
-        (analysis.subject?.toLowerCase().includes(keyword.toLowerCase()) || false) ||
-        (analysis.purpose?.toLowerCase().includes(keyword.toLowerCase()) || false);
-
-      if (inKeywords) {
-        score += 3; // Higher weight for direct keyword match
-        matched.push(keyword);
-      } else if (inText) {
-        score += 2;
-        matched.push(keyword);
-      }
-    });
-
-    // Boost score if department is mentioned
-    if (Array.isArray(analysis.mentioned_departments)) {
-      if (analysis.mentioned_departments.some(m => 
-        dept.toLowerCase().includes(m.toLowerCase()) || 
-        m.toLowerCase().includes(dept.toLowerCase())
-      )) {
-        score += 5;
-      }
     }
-
-    departmentScores[dept] = {
-      score,
-      matchedKeywords: matched,
-      head: departmentDatabase[dept].head
+    return {
+      department: scraped ? scraped.name : d.name,
+      head: scraped?.head || '',
+      description: d.reason || '',
+      score: Math.round(((d.confidence || 0) / 100) * 30),
+      matchedKeywords: parsed.keywords || []
     };
   });
 
-  // Sort departments by score (descending)
-  const sorted = Object.entries(departmentScores)
-    .filter(([_, data]) => data.score > 0)
-    .sort((a, b) => b[1].score - a[1].score)
-    .map(([dept, data]) => ({
-      department: dept,
-      head: data.head,
-      score: data.score,
-      matchedKeywords: data.matchedKeywords,
-      description: departmentDatabase[dept].description
-    }));
-
-  return sorted;
+  return {
+    documentAnalysis: {
+      fileName,
+      subject: parsed.subject || '',
+      documentType: parsed.documentType || 'Boshqa',
+      urgency: parsed.urgency || "O'rta",
+      purpose: parsed.purpose || '',
+      keywords: parsed.keywords || [],
+      summaryUz: parsed.summary_uz || ''
+    },
+    routingResult: {
+      primaryDepartment: rankedDepts[0] || null,
+      allDepartments: rankedDepts,
+      recommendation: rankedDepts[0]
+        ? `${rankedDepts[0].department} kafedrasiga yo'naltiring. ${rankedDepts[0].description}`
+        : 'Tegishli kafedra topilmadi'
+    }
+  };
 }
 
-/**
- * Main API endpoint for document processing
- */
-app.post('/api/process-correspondence', upload.single('file'), async (req, res) => {
+// POST /api/process-correspondence
+app.post('/api/process-correspondence', (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message });
+    next();
+  });
+}, async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
   try {
-    if (!req.file) {
-      return res.status(400).json({
-        error: 'No file uploaded',
-        success: false
-      });
-    }
-
-    // Analyze document
-    const analysis = await analyzeDocument(req.file.path, req.file.originalname);
-
-    // Categorize and rank departments
-    const departments = categorizeDepartments(analysis);
-
-    // Clean up uploaded file
-    await fs.unlink(req.file.path);
-
-    // Return response
-    res.json({
-      success: true,
-      documentAnalysis: {
-        fileName: req.file.originalname,
-        subject: analysis.subject,
-        purpose: analysis.purpose,
-        documentType: analysis.document_type,
-        urgency: analysis.urgency,
-        keywords: analysis.keywords
-      },
-      routingResult: {
-        primaryDepartment: departments.length > 0 ? departments[0] : null,
-        allDepartments: departments,
-        totalMatches: departments.length,
-        recommendation: departments.length > 0
-          ? `Primary routing to ${departments[0].department} (Head: ${departments[0].head}). Secondary review by ${departments.slice(1, 3).map(d => d.department).join(', ')}.`
-          : 'No matching departments found. Manual review required.'
-      }
-    });
-  } catch (error) {
-    console.error('Error processing document:', error);
-    res.status(500).json({
-      error: error.message || 'Error processing document',
-      success: false
-    });
+    const result = await analyze(req.file.path, req.file.mimetype, req.file.originalname);
+    await fsp.unlink(req.file.path);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error('Processing error:', err);
+    fsp.unlink(req.file.path).catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-/**
- * Bulk processing endpoint
- */
-app.post('/api/process-bulk', upload.array('files', 10), async (req, res) => {
-  try {
-    if (!req.files || req.files.length === 0) {
-      return res.status(400).json({
-        error: 'No files uploaded',
-        success: false
-      });
-    }
-
-    const results = [];
-
-    for (const file of req.files) {
-      try {
-        const analysis = await analyzeDocument(file.path, file.originalname);
-        const departments = categorizeDepartments(analysis);
-        
-        results.push({
-          fileName: file.originalname,
-          success: true,
-          analysis,
-          routing: {
-            primary: departments[0] || null,
-            all: departments
-          }
-        });
-
-        // Clean up
-        await fs.unlink(file.path);
-      } catch (error) {
-        results.push({
-          fileName: file.originalname,
-          success: false,
-          error: error.message
-        });
-      }
-    }
-
-    res.json({
-      success: true,
-      processedFiles: results.length,
-      results
-    });
-  } catch (error) {
-    console.error('Error in bulk processing:', error);
-    res.status(500).json({
-      error: error.message,
-      success: false
-    });
-  }
-});
-
-/**
- * Get available departments
- */
+// GET /api/departments
 app.get('/api/departments', (req, res) => {
-  const departments = Object.entries(departmentDatabase).map(([name, data]) => ({
-    name,
-    head: data.head,
-    keywords: data.keywords,
-    description: data.description
-  }));
-
-  res.json({
-    success: true,
-    departments,
-    total: departments.length
-  });
+  res.json({ departments, total: departments.length });
 });
 
-/**
- * Health check
- */
+// GET /api/health
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'Chancellery Correspondence Router',
-    version: '1.0.0'
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({
-    error: err.message,
-    success: false
-  });
+  res.json({ status: 'ok', service: 'University Correspondence Router', version: '1.0.0' });
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Chancellery Correspondence Router API running on port ${PORT}`);
-  console.log(`POST /api/process-correspondence - Process single document`);
-  console.log(`POST /api/process-bulk - Process multiple documents`);
-  console.log(`GET /api/departments - List all departments`);
+
+loadDepartments().then(() => {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 });
